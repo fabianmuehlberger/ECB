@@ -1,0 +1,797 @@
+# Fan Controller: Four PWM fan outputs with shared PI temperature control.
+# Sensors: Dallas 1-Wire, AHT20, ESP32 internal.
+# All fans share one target temperature and one sensor source selector.
+# Ver 5.0 -- Unified safety override, stall detection, on-boot fan burst.
+#
+# Safety policy: on overtemp, sensor failure, or all-NaN, ALL fans are forced
+# to 100% regardless of auto/manual mode. Cleared with hysteresis.
+#
+# To scan Dallas 1-Wire addresses, temporarily set logger level to DEBUG.
+
+substitutions:
+  devicename: fanctrl
+  friendlyname: Fan Controller
+  fdevicename: ""
+
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # PI controller tuning
+  p_gain: "20"
+  i_gain: "0.03"
+
+  # Safety threshold -- alarm triggers if ANY sensor exceeds this
+  alarm_temp: "50"
+  # Degrees below alarm_temp before the safety override clears
+  alarm_hysteresis: "3"
+
+  # Dallas 1-Wire address (scan with logger level DEBUG)
+  dallasaddress1: "0xacc5035009646128"
+
+  # 4-pin PWM fan spec frequency
+  pwm_freq: "25600Hz"
+
+
+# ─── Core ────────────────────────────────────────────────────────────────────
+
+esphome:
+  name: ${devicename}
+  friendly_name: ${friendlyname}
+  min_version: "2024.11.0"
+  on_boot:
+    priority: 600
+    then:
+      - lambda: |-
+          id(pi_integral) = 0.0f;
+          id(safety_override) = false;
+          id(overtemp_ticks) = 0;
+          id(stall_count_1) = 0;
+          id(stall_count_2) = 0;
+          id(stall_count_3) = 0;
+          id(stall_count_4) = 0;
+      - fan.turn_on:
+          id: fan1_speed
+          speed: 100
+      - fan.turn_on:
+          id: fan2_speed
+          speed: 100
+      - fan.turn_on:
+          id: fan3_speed
+          speed: 100
+      - fan.turn_on:
+          id: fan4_speed
+          speed: 100
+
+esp32:
+  board: wemos_d1_mini32
+  variant: esp32
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32_REV_MIN_3_1: "y"
+
+preferences:
+  flash_write_interval: 10min
+
+
+# ─── Network ─────────────────────────────────────────────────────────────────
+
+wifi:
+  ssid: ${ssid}
+  password: ${password}
+  ap:
+    ssid: ${fdevicename}Fallback Hotspot
+    password: !secret ap_password
+    manual_ip:
+      static_ip: 192.168.100.2
+      gateway: 192.168.100.2
+      subnet: 255.255.255.0
+
+captive_portal:
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s
+
+web_server:
+  port: 80
+  version: 3
+  local: true
+  log: false
+
+time:
+  - platform: sntp
+    id: current_time
+
+
+# ─── Logging & Diagnostics ──────────────────────────────────────────────────
+
+logger:
+  level: INFO
+
+debug:
+  update_interval: 120s
+
+
+# ─── Globals ─────────────────────────────────────────────────────────────────
+
+globals:
+  - id: pi_integral
+    type: float
+    restore_value: no
+    initial_value: "0"
+  - id: safety_override
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: overtemp_ticks
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: stall_count_1
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: stall_count_2
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: stall_count_3
+    type: int
+    restore_value: no
+    initial_value: "0"
+  - id: stall_count_4
+    type: int
+    restore_value: no
+    initial_value: "0"
+
+
+# ─── User Controls ──────────────────────────────────────────────────────────
+
+number:
+  - platform: template
+    id: set_target_temp
+    name: ${fdevicename}Fan Target
+    optimistic: true
+    min_value: 20
+    max_value: 40
+    initial_value: "25"
+    step: 1
+    restore_value: true
+    icon: mdi:temperature-celsius
+    on_value:
+      then:
+        - lambda: 'global_preferences->sync();'
+
+  - platform: template
+    id: set_alarm_temp
+    name: ${fdevicename}Alarm Threshold
+    optimistic: true
+    min_value: 20
+    max_value: 70
+    initial_value: ${alarm_temp}
+    step: 1
+    restore_value: true
+    entity_category: config
+    icon: mdi:thermometer-alert
+    on_value:
+      then:
+        - lambda: 'global_preferences->sync();'
+
+select:
+  - platform: template
+    name: ${fdevicename}Temperature Source
+    id: fan_temp_source
+    icon: mdi:thermometer-check
+    optimistic: true
+    restore_value: true
+    options:
+      - Dallas_1
+      - ESP32_Internal
+      - AHT20T
+    initial_option: Dallas_1
+    on_value:
+      then:
+        - globals.set:
+            id: pi_integral
+            value: "0"
+        - lambda: 'global_preferences->sync();'
+
+switch:
+  - platform: restart
+    name: ${fdevicename}Restart
+    entity_category: config
+    icon: mdi:restart
+
+  - platform: gpio
+    name: ${fdevicename}Relay 0
+    pin: GPIO18
+    id: relay_0
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    icon: mdi:power
+
+  - platform: template
+    id: auto_fan1
+    name: ${fdevicename}Fan 1 Auto
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    icon: mdi:fan-auto
+    turn_off_action:
+      then:
+        # Set speed to minimum then turn off to ensure PWM goes to zero
+        - fan.turn_on:
+            id: fan1_speed
+            speed: 1
+        - fan.turn_off:
+            id: fan1_speed
+
+  - platform: template
+    id: auto_fan2
+    name: ${fdevicename}Fan 2 Auto
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    icon: mdi:fan-auto
+    turn_off_action:
+      then:
+        - fan.turn_on:
+            id: fan2_speed
+            speed: 1
+        - fan.turn_off:
+            id: fan2_speed
+
+  - platform: template
+    id: auto_fan3
+    name: ${fdevicename}Fan 3 Auto
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    icon: mdi:fan-auto
+    turn_off_action:
+      then:
+        - fan.turn_on:
+            id: fan3_speed
+            speed: 1
+        - fan.turn_off:
+            id: fan3_speed
+
+  - platform: template
+    id: auto_fan4
+    name: ${fdevicename}Fan 4 Auto
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    icon: mdi:fan-auto
+    turn_off_action:
+      then:
+        - fan.turn_on:
+            id: fan4_speed
+            speed: 1
+        - fan.turn_off:
+            id: fan4_speed
+
+  - platform: gpio
+    id: oc_port
+    name: ${fdevicename}OC Port
+    restore_mode: ALWAYS_ON
+    entity_category: config
+    icon: mdi:light-switch
+    pin:
+      number: GPIO26
+      mode:
+        output: true
+        pullup: true
+
+button:
+  - platform: safe_mode
+    name: ${fdevicename}Safe Mode
+    entity_category: config
+    icon: mdi:shield-refresh
+
+  - platform: template
+    name: ${fdevicename}Safety Reset
+    icon: mdi:shield-off
+    on_press:
+      then:
+        - lambda: |-
+            id(safety_override) = false;
+            id(overtemp_ticks) = 0;
+            id(pi_integral) = 0.0f;
+            id(stall_count_1) = 0;
+            id(stall_count_2) = 0;
+            id(stall_count_3) = 0;
+            id(stall_count_4) = 0;
+            ESP_LOGI("fanctrl", "Safety override manually reset");
+
+  - platform: factory_reset
+    name: ${fdevicename}Factory Reset
+    entity_category: config
+    icon: mdi:restart-alert
+
+
+# ─── Hardware: Buses ─────────────────────────────────────────────────────────
+
+one_wire:
+  - platform: gpio
+    pin: GPIO27
+
+i2c:
+  - id: bus_a
+    sda: GPIO21
+    scl: GPIO22
+    scan: true
+    frequency: 400kHz
+  - id: bus_b
+    sda: GPIO16
+    scl: GPIO17
+    scan: true
+    frequency: 800kHz
+
+
+# ─── Hardware: PWM Outputs ───────────────────────────────────────────────────
+
+output:
+  - platform: ledc
+    pin: GPIO13
+    id: fan1
+    frequency: ${pwm_freq}
+
+  - platform: ledc
+    pin: GPIO14
+    id: fan2
+    frequency: ${pwm_freq}
+
+  - platform: ledc
+    pin: GPIO25
+    id: fan3
+    frequency: ${pwm_freq}
+
+  - platform: ledc
+    pin: GPIO32
+    id: fan4
+    frequency: ${pwm_freq}
+
+  - platform: ledc
+    pin:
+      number: GPIO2
+      ignore_strapping_warning: true
+    id: alarm_led_output
+
+
+# ─── Alarm LED ───────────────────────────────────────────────────────────────
+
+light:
+  - platform: monochromatic
+    id: alarm_light
+    output: alarm_led_output
+    name: ${fdevicename}Alarm Light
+    entity_category: config
+    icon: mdi:alert
+    effects:
+      - pulse:
+          name: "Fast Pulse"
+          transition_length: 0.5s
+          update_interval: 0.5s
+          min_brightness: 0%
+          max_brightness: 100%
+
+
+# ─── Fan Entities ────────────────────────────────────────────────────────────
+
+fan:
+  - platform: speed
+    output: fan1
+    id: fan1_speed
+    name: ${fdevicename}Fan 1 Speed
+    icon: mdi:fan
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: speed
+    output: fan2
+    id: fan2_speed
+    name: ${fdevicename}Fan 2 Speed
+    icon: mdi:fan
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: speed
+    output: fan3
+    id: fan3_speed
+    name: ${fdevicename}Fan 3 Speed
+    icon: mdi:fan
+    restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: speed
+    output: fan4
+    id: fan4_speed
+    name: ${fdevicename}Fan 4 Speed
+    icon: mdi:fan
+    restore_mode: RESTORE_DEFAULT_OFF
+
+
+# ─── Control Loop ────────────────────────────────────────────────────────────
+
+interval:
+  - interval: 2s
+    startup_delay: 2s
+    then:
+      - lambda: |-
+          // ── 1. Read sensors ──
+          // raw_state detects NaN immediately even with filter_out: NaN
+          // .state gives calibrated values for overtemp comparison and PI control
+          const bool dallas_nan = std::isnan(id(Dallas_1).raw_state);
+          const bool aht20_nan  = std::isnan(id(AHT20T).raw_state);
+          const bool esp32_nan  = std::isnan(id(esp32_internal_temp).raw_state);
+          const bool any_ok     = !dallas_nan || !aht20_nan || !esp32_nan;
+          const bool all_nan    = dallas_nan && aht20_nan && esp32_nan;
+
+          const float limit       = id(set_alarm_temp).state;
+          const float clear_limit = limit - ${alarm_hysteresis};
+
+          // Selected source: raw for NaN check, state for PI calculation
+          float selected_raw = NAN;
+          float actual = NAN;
+          auto idx = id(fan_temp_source).active_index();
+          if (idx.has_value()) {
+            switch (idx.value()) {
+              case 0:
+                selected_raw = id(Dallas_1).raw_state;
+                actual       = id(Dallas_1).state;
+                break;
+              case 1:
+                selected_raw = id(esp32_internal_temp).raw_state;
+                actual       = id(esp32_internal_temp).state;
+                break;
+              case 2:
+                selected_raw = id(AHT20T).raw_state;
+                actual       = id(AHT20T).state;
+                break;
+              default:
+                ESP_LOGE("fanctrl", "Invalid temp source index: %d", idx.value());
+                break;
+            }
+          }
+
+          // ── 2. Evaluate safety triggers ──
+          bool trigger = false;
+
+          // A: Overtemp -- any valid sensor above alarm threshold for 10s (5 ticks)
+          bool any_overtemp = (!dallas_nan && id(Dallas_1).state >= limit)
+                           || (!aht20_nan  && id(AHT20T).state  >= limit)
+                           || (!esp32_nan  && id(esp32_internal_temp).state >= limit);
+          if (any_overtemp) {
+            if (++id(overtemp_ticks) >= 5) trigger = true;
+          } else {
+            id(overtemp_ticks) = 0;
+          }
+
+          // B: Selected PI source is NaN (immediate)
+          if (std::isnan(selected_raw)) {
+            trigger = true;
+            ESP_LOGW("fanctrl", "Selected temp source NaN");
+          }
+
+          // C: ALL sensors NaN (immediate)
+          if (all_nan) {
+            trigger = true;
+            ESP_LOGW("fanctrl", "All sensors NaN");
+          }
+
+          // ── 3. Set/clear safety_override with hysteresis ──
+          if (trigger) {
+            if (!id(safety_override)) ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED");
+            id(safety_override) = true;
+          } else if (id(safety_override)) {
+            // Clear only when all valid sensors are below clear_limit
+            bool all_clear = any_ok && !std::isnan(selected_raw);
+            if (!dallas_nan && id(Dallas_1).state >= clear_limit) all_clear = false;
+            if (!aht20_nan  && id(AHT20T).state  >= clear_limit) all_clear = false;
+            if (!esp32_nan  && id(esp32_internal_temp).state >= clear_limit) all_clear = false;
+            bool stall_clear = id(stall_count_1) < 15 && id(stall_count_2) < 15
+                            && id(stall_count_3) < 15 && id(stall_count_4) < 15;
+            if (all_clear && stall_clear) {
+              id(safety_override) = false;
+              id(pi_integral) = 0.0f;
+              ESP_LOGI("fanctrl", "Safety override cleared");
+            }
+          }
+
+          // ── 4. Apply fan control ──
+          if (id(safety_override)) {
+            // Force ALL fans to 100% regardless of auto/manual mode
+            auto force_max = [](auto *fan) {
+              auto call = fan->turn_on();
+              call.set_speed(100);
+              call.perform();
+            };
+            force_max(id(fan1_speed));
+            force_max(id(fan2_speed));
+            force_max(id(fan3_speed));
+            force_max(id(fan4_speed));
+          } else {
+            // Normal PI controller for auto-mode fans
+            const bool any_auto = id(auto_fan1).state || id(auto_fan2).state
+                               || id(auto_fan3).state || id(auto_fan4).state;
+            float speed = 1.0f;
+
+            if (any_auto && !std::isnan(actual)) {
+              const float target = id(set_target_temp).state;
+              if (!std::isnan(target)) {
+                const float error = actual - target;
+                float raw_speed = error * ${p_gain} + id(pi_integral) * ${i_gain};
+                if (raw_speed > 0.0f && raw_speed < 100.0f) {
+                  id(pi_integral) += error;
+                  if (id(pi_integral) >  350.0f) id(pi_integral) =  350.0f;
+                  if (id(pi_integral) < -350.0f) id(pi_integral) = -350.0f;
+                }
+                speed = raw_speed;
+                if (speed > 100.0f) speed = 100.0f;
+                if (speed <   0.0f) speed = 0.0f;
+              } else {
+                speed = 100.0f;
+              }
+            }
+
+            // Slew rate limiter: max 3% change per tick to reduce fan noise
+            static float prev_speed = 0.0f;
+            const float max_step = 3.0f;
+            if (speed > prev_speed + max_step) speed = prev_speed + max_step;
+            if (speed < prev_speed - max_step) speed = prev_speed - max_step;
+            prev_speed = speed;
+
+            const float target = id(set_target_temp).state;
+            const bool temp_valid = !std::isnan(actual) && !std::isnan(target);
+            const bool too_cold = temp_valid && (actual < target - 2.0f);
+
+            auto apply = [&](auto *fan) {
+              if (too_cold && fan->state) {
+                auto off = fan->turn_off();
+                off.set_speed(1);
+                off.perform();
+              } else if (!too_cold) {
+                auto on = fan->turn_on();
+                on.set_speed(std::max(speed, 20.0f));
+                on.perform();
+              }
+            };
+            if (id(auto_fan1).state) apply(id(fan1_speed));
+            if (id(auto_fan2).state) apply(id(fan2_speed));
+            if (id(auto_fan3).state) apply(id(fan3_speed));
+            if (id(auto_fan4).state) apply(id(fan4_speed));
+          }
+
+          // ── 5. Fan stall detection (skipped during safety override) ──
+          // If fan is ON at >50% but RPM is 0 for 30s (15 ticks), raise alarm.
+          // During override all fans are forced to 100% including unused ports,
+          // so stall checks would false-positive on unconnected fans.
+          bool any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
+                        || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
+          if (!id(safety_override)) {
+            auto check_stall = [](auto *fan, float rpm, int &counter, const char *name) {
+              if (fan->state && fan->speed > 50 && rpm <= 0.0f && !std::isnan(rpm)) {
+                if (++counter == 15) ESP_LOGW("fanctrl", "Fan stall detected: %s", name);
+                if (counter > 16) counter = 16;
+              } else {
+                counter = 0;
+              }
+            };
+            check_stall(id(fan1_speed), id(fan1_rpm).state, id(stall_count_1), "Fan 1");
+            check_stall(id(fan2_speed), id(fan2_rpm).state, id(stall_count_2), "Fan 2");
+            check_stall(id(fan3_speed), id(fan3_rpm).state, id(stall_count_3), "Fan 3");
+            check_stall(id(fan4_speed), id(fan4_rpm).state, id(stall_count_4), "Fan 4");
+            any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
+                     || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
+            if (any_stall) {
+              ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED (fan stall)");
+              id(safety_override) = true;
+            }
+          }
+
+          // ── 6. Alarm LED and binary sensor ──
+          static bool alarm_was_active = false;
+          bool alarm_active = id(safety_override) || any_stall;
+          if (alarm_active && !alarm_was_active) {
+            auto call = id(alarm_light).turn_on();
+            call.set_effect("Fast Pulse");
+            call.perform();
+            id(alarm_sen).publish_state(true);
+          } else if (!alarm_active && alarm_was_active) {
+            auto call = id(alarm_light).turn_off();
+            call.perform();
+            id(alarm_sen).publish_state(false);
+          }
+          alarm_was_active = alarm_active;
+
+
+# ─── Temperature Sensors ─────────────────────────────────────────────────────
+
+sensor:
+  - platform: dallas_temp
+    address: ${dallasaddress1}
+    id: Dallas_1
+    name: ${fdevicename}Dallas Temp 1
+    update_interval: 2s
+    unit_of_measurement: "°C"
+    device_class: temperature
+    icon: mdi:thermometer
+    filters:
+      - filter_out: NaN
+
+  - platform: aht10
+    i2c_id: bus_b
+    address: 0x38
+    variant: AHT20
+    update_interval: 2s
+    temperature:
+      id: AHT20T
+      name: ${fdevicename}AHT20 Temp
+      device_class: temperature
+      icon: mdi:thermometer
+      filters:
+        - filter_out: NaN
+        - offset: -6.0
+    humidity:
+      name: ${fdevicename}AHT20 Humidity
+      id: AHT20H
+      device_class: humidity
+      icon: mdi:water-percent
+      filters:
+        - filter_out: NaN
+
+  - platform: internal_temperature
+    id: esp32_internal_temp
+    name: ${fdevicename}ESP32 Temp
+    unit_of_measurement: "°C"
+    entity_category: diagnostic
+    icon: mdi:thermometer
+    update_interval: 30s
+    web_server:
+      sorting_weight: 7
+
+
+  # ─── Fan RPM Monitors ────────────────────────────────────────────────────
+
+  - platform: pulse_counter
+    pin: GPIO33
+    id: fan1_rpm
+    unit_of_measurement: rpm
+    name: ${fdevicename}Fan 1 RPM
+    device_class: speed
+    icon: mdi:fan
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+  - platform: pulse_counter
+    pin: GPIO34
+    id: fan2_rpm
+    unit_of_measurement: rpm
+    name: ${fdevicename}Fan 2 RPM
+    device_class: speed
+    icon: mdi:fan
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+  - platform: pulse_counter
+    pin: GPIO35
+    id: fan3_rpm
+    unit_of_measurement: rpm
+    name: ${fdevicename}Fan 3 RPM
+    device_class: speed
+    icon: mdi:fan
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+  - platform: pulse_counter
+    pin: GPIO39
+    id: fan4_rpm
+    unit_of_measurement: rpm
+    name: ${fdevicename}Fan 4 RPM
+    device_class: speed
+    icon: mdi:fan
+    update_interval: 5s
+    filters:
+      - multiply: 0.5
+
+
+  # ─── Network & System Diagnostics ────────────────────────────────────────
+
+  - platform: wifi_signal
+    name: ${fdevicename}WiFi Signal
+    entity_category: diagnostic
+    icon: mdi:wifi
+    update_interval: 30s
+    web_server:
+      sorting_weight: 4
+
+  - platform: uptime
+    name: ${fdevicename}Uptime
+    entity_category: diagnostic
+    icon: mdi:timer-sync-outline
+    update_interval: 60s
+    web_server:
+      sorting_weight: 6
+
+  - platform: debug
+    free:
+      name: ${fdevicename}Heap Free
+      entity_category: diagnostic
+      web_server:
+        sorting_weight: 9
+    block:
+      name: ${fdevicename}Heap Max Block
+      entity_category: diagnostic
+      web_server:
+        sorting_weight: 10
+    loop_time:
+      name: ${fdevicename}Loop Time
+      entity_category: diagnostic
+      web_server:
+        sorting_weight: 8
+
+
+# ─── Text Sensors ────────────────────────────────────────────────────────────
+
+text_sensor:
+  - platform: template
+    name: ${fdevicename}Device
+    entity_category: diagnostic
+    icon: mdi:devices
+    lambda: 'return {"ESP32 Control Board (IDF)"};'
+    web_server:
+      sorting_weight: 14
+
+  - platform: version
+    name: ${fdevicename}ESPHome Version
+    entity_category: diagnostic
+    web_server:
+      sorting_weight: 15
+
+  - platform: wifi_info
+    ip_address:
+      name: ${fdevicename}IP Address
+      entity_category: diagnostic
+      icon: mdi:ip
+      web_server:
+        sorting_weight: 0
+    ssid:
+      name: ${fdevicename}Connected SSID
+      entity_category: diagnostic
+      icon: mdi:wifi
+      web_server:
+        sorting_weight: 2
+    bssid:
+      name: ${fdevicename}Connected BSSID
+      entity_category: diagnostic
+      icon: mdi:wifi
+      web_server:
+        sorting_weight: 3
+    mac_address:
+      name: ${fdevicename}MAC Address
+      entity_category: diagnostic
+      icon: mdi:wifi
+      web_server:
+        sorting_weight: 1
+
+  - platform: debug
+    reset_reason:
+      name: ${fdevicename}Reset Reason
+      entity_category: diagnostic
+
+
+# ─── Binary Sensors ──────────────────────────────────────────────────────────
+
+binary_sensor:
+  - platform: status
+    name: ${fdevicename}Status
+    entity_category: diagnostic
+    icon: mdi:lan-connect
+
+  - platform: template
+    id: alarm_sen
+    name: ${fdevicename}Alarm
+    icon: mdi:fire-alert
