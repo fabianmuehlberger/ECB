@@ -83,8 +83,8 @@ wifi:
     ssid: ${fdevicename}Fallback Hotspot
     password: !secret ap_password
     manual_ip:
-      static_ip: 192.168.100.2
-      gateway: 192.168.100.2
+      static_ip: 10.1.10.2
+      gateway: 10.1.10.2
       subnet: 255.255.255.0
 
 captive_portal:
@@ -102,7 +102,10 @@ web_server:
   port: 80
   version: 3
   local: true
-  log: false
+  log: true
+  auth:
+    username: !secret web_username
+    password: !secret web_password
 
 time:
   - platform: sntp
@@ -112,7 +115,10 @@ time:
 # ─── Logging & Diagnostics ──────────────────────────────────────────────────
 
 logger:
-  level: INFO
+  level: WARN
+  logs:
+    fanctrl: WARN
+    fan: WARN
 
 debug:
   update_interval: 120s
@@ -149,6 +155,10 @@ globals:
     type: int
     restore_value: no
     initial_value: "0"
+  - id: alarm_reason
+    type: std::string
+    restore_value: no
+    initial_value: '"none"'
 
 
 # ─── User Controls ──────────────────────────────────────────────────────────
@@ -304,7 +314,9 @@ button:
             id(stall_count_2) = 0;
             id(stall_count_3) = 0;
             id(stall_count_4) = 0;
-            ESP_LOGI("fanctrl", "Safety override manually reset");
+            id(alarm_reason) = "manual_reset";
+            id(alarm_reason_text).publish_state("manual_reset");
+            ESP_LOGW("fanctrl", "Safety override manually reset");
 
   - platform: factory_reset
     name: ${fdevicename}Factory Reset
@@ -418,89 +430,138 @@ interval:
     startup_delay: 2s
     then:
       - lambda: |-
+          static uint32_t tick = 0;
+          tick++;
+
           // ── 1. Read sensors ──
-          // raw_state detects NaN immediately even with filter_out: NaN
-          // .state gives calibrated values for overtemp comparison and PI control
-          const bool dallas_nan = std::isnan(id(Dallas_1).raw_state);
-          const bool aht20_nan  = std::isnan(id(AHT20T).raw_state);
-          const bool esp32_nan  = std::isnan(id(esp32_internal_temp).raw_state);
+          const float dallas_raw  = id(Dallas_1).raw_state;
+          const float dallas_cal  = id(Dallas_1).state;
+          const float aht20_raw   = id(AHT20T).raw_state;
+          const float aht20_cal   = id(AHT20T).state;
+          const float esp32_raw   = id(esp32_internal_temp).raw_state;
+          const float esp32_cal   = id(esp32_internal_temp).state;
+
+          const bool dallas_nan = std::isnan(dallas_raw);
+          const bool aht20_nan  = std::isnan(aht20_raw);
+          const bool esp32_nan  = std::isnan(esp32_raw);
           const bool any_ok     = !dallas_nan || !aht20_nan || !esp32_nan;
           const bool all_nan    = dallas_nan && aht20_nan && esp32_nan;
 
           const float limit       = id(set_alarm_temp).state;
           const float clear_limit = limit - ${alarm_hysteresis};
 
-          // Selected source: raw for NaN check, state for PI calculation
+          ESP_LOGV("fanctrl", "[%u] SENSORS raw: dallas=%.2f aht20=%.2f esp32=%.2f | nan: d=%d a=%d e=%d all=%d",
+                   tick, dallas_raw, aht20_raw, esp32_raw, dallas_nan, aht20_nan, esp32_nan, all_nan);
+          ESP_LOGV("fanctrl", "[%u] SENSORS cal: dallas=%.2f aht20=%.2f esp32=%.2f | limit=%.1f clear=%.1f",
+                   tick, dallas_cal, aht20_cal, esp32_cal, limit, clear_limit);
+
           float selected_raw = NAN;
           float actual = NAN;
+          const char *src_name = "UNKNOWN";
           auto idx = id(fan_temp_source).active_index();
           if (idx.has_value()) {
             switch (idx.value()) {
               case 0:
-                selected_raw = id(Dallas_1).raw_state;
-                actual       = id(Dallas_1).state;
+                selected_raw = dallas_raw;
+                actual       = dallas_cal;
+                src_name     = "Dallas_1";
                 break;
               case 1:
-                selected_raw = id(esp32_internal_temp).raw_state;
-                actual       = id(esp32_internal_temp).state;
+                selected_raw = esp32_raw;
+                actual       = esp32_cal;
+                src_name     = "ESP32_Int";
                 break;
               case 2:
-                selected_raw = id(AHT20T).raw_state;
-                actual       = id(AHT20T).state;
+                selected_raw = aht20_raw;
+                actual       = aht20_cal;
+                src_name     = "AHT20";
                 break;
               default:
-                ESP_LOGE("fanctrl", "Invalid temp source index: %d", idx.value());
+                ESP_LOGE("fanctrl", "[%u] Invalid temp source index: %d", tick, idx.value());
                 break;
             }
           }
+          ESP_LOGV("fanctrl", "[%u] SELECTED src=%s raw=%.2f cal=%.2f", tick, src_name, selected_raw, actual);
 
           // ── 2. Evaluate safety triggers ──
           bool trigger = false;
+          std::string reason;
 
-          // A: Overtemp -- any valid sensor above alarm threshold for 10s (5 ticks)
-          bool any_overtemp = (!dallas_nan && id(Dallas_1).state >= limit)
-                           || (!aht20_nan  && id(AHT20T).state  >= limit)
-                           || (!esp32_nan  && id(esp32_internal_temp).state >= limit);
+          bool ot_dallas = !dallas_nan && dallas_cal >= limit;
+          bool ot_aht20  = !aht20_nan  && aht20_cal  >= limit;
+          bool ot_esp32  = !esp32_nan  && esp32_cal  >= limit;
+          bool any_overtemp = ot_dallas || ot_aht20 || ot_esp32;
+
           if (any_overtemp) {
-            if (++id(overtemp_ticks) >= 5) trigger = true;
+            id(overtemp_ticks)++;
+            ESP_LOGW("fanctrl", "[%u] OVERTEMP tick %d/5 (d=%.1f%s a=%.1f%s e=%.1f%s)",
+                     tick, id(overtemp_ticks),
+                     dallas_cal, ot_dallas ? "!" : "", aht20_cal, ot_aht20 ? "!" : "",
+                     esp32_cal, ot_esp32 ? "!" : "");
+            if (id(overtemp_ticks) >= 5) {
+              trigger = true;
+              reason = "OVERTEMP(";
+              if (ot_dallas) reason += "dallas=" + std::to_string(dallas_cal) + " ";
+              if (ot_aht20)  reason += "aht20=" + std::to_string(aht20_cal) + " ";
+              if (ot_esp32)  reason += "esp32=" + std::to_string(esp32_cal) + " ";
+              reason += "limit=" + std::to_string(limit) + ")";
+            }
           } else {
+            if (id(overtemp_ticks) > 0)
+              ESP_LOGW("fanctrl", "[%u] OVERTEMP reset (was %d ticks)", tick, id(overtemp_ticks));
             id(overtemp_ticks) = 0;
           }
 
-          // B: Selected PI source is NaN (immediate)
           if (std::isnan(selected_raw)) {
             trigger = true;
-            ESP_LOGW("fanctrl", "Selected temp source NaN");
+            std::string nan_reason = "SELECTED_NAN(src=" + std::string(src_name) + ")";
+            if (reason.empty()) reason = nan_reason; else reason += " + " + nan_reason;
+            ESP_LOGW("fanctrl", "[%u] TRIGGER: selected source %s is NaN", tick, src_name);
           }
 
-          // C: ALL sensors NaN (immediate)
           if (all_nan) {
             trigger = true;
-            ESP_LOGW("fanctrl", "All sensors NaN");
+            std::string nan_reason = "ALL_SENSORS_NAN";
+            if (reason.empty()) reason = nan_reason; else reason += " + " + nan_reason;
+            ESP_LOGW("fanctrl", "[%u] TRIGGER: ALL sensors NaN", tick);
           }
+
+          ESP_LOGV("fanctrl", "[%u] SAFETY pre: override=%d trigger=%d overtemp_ticks=%d stall=[%d,%d,%d,%d]",
+                   tick, id(safety_override), trigger, id(overtemp_ticks),
+                   id(stall_count_1), id(stall_count_2), id(stall_count_3), id(stall_count_4));
 
           // ── 3. Set/clear safety_override with hysteresis ──
           if (trigger) {
-            if (!id(safety_override)) ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED");
+            if (!id(safety_override)) {
+              ESP_LOGW("fanctrl", "[%u] >>> SAFETY OVERRIDE ACTIVATED: %s", tick, reason.c_str());
+              id(alarm_reason) = reason;
+              id(alarm_reason_text).publish_state(reason);
+            }
             id(safety_override) = true;
           } else if (id(safety_override)) {
-            // Clear only when all valid sensors are below clear_limit
             bool all_clear = any_ok && !std::isnan(selected_raw);
-            if (!dallas_nan && id(Dallas_1).state >= clear_limit) all_clear = false;
-            if (!aht20_nan  && id(AHT20T).state  >= clear_limit) all_clear = false;
-            if (!esp32_nan  && id(esp32_internal_temp).state >= clear_limit) all_clear = false;
+            bool dc = !dallas_nan && dallas_cal >= clear_limit;
+            bool ac = !aht20_nan  && aht20_cal  >= clear_limit;
+            bool ec = !esp32_nan  && esp32_cal  >= clear_limit;
+            if (dc) all_clear = false;
+            if (ac) all_clear = false;
+            if (ec) all_clear = false;
             bool stall_clear = id(stall_count_1) < 15 && id(stall_count_2) < 15
                             && id(stall_count_3) < 15 && id(stall_count_4) < 15;
+            ESP_LOGW("fanctrl", "[%u] CLEAR CHECK: any_ok=%d sel_ok=%d temps_clear=%d(d=%d,a=%d,e=%d) stall_clear=%d",
+                     tick, any_ok, !std::isnan(selected_raw), all_clear && !dc && !ac && !ec,
+                     !dc, !ac, !ec, stall_clear);
             if (all_clear && stall_clear) {
               id(safety_override) = false;
               id(pi_integral) = 0.0f;
-              ESP_LOGI("fanctrl", "Safety override cleared");
+              ESP_LOGW("fanctrl", "[%u] <<< SAFETY OVERRIDE CLEARED (was: %s)", tick, id(alarm_reason).c_str());
+              id(alarm_reason) = "none";
+              id(alarm_reason_text).publish_state("none");
             }
           }
 
           // ── 4. Apply fan control ──
           if (id(safety_override)) {
-            // Force ALL fans to 100% regardless of auto/manual mode
             auto force_max = [](auto *fan) {
               auto call = fan->turn_on();
               call.set_speed(100);
@@ -511,7 +572,6 @@ interval:
             force_max(id(fan3_speed));
             force_max(id(fan4_speed));
           } else {
-            // Normal PI controller for auto-mode fans
             const bool any_auto = id(auto_fan1).state || id(auto_fan2).state
                                || id(auto_fan3).state || id(auto_fan4).state;
             float speed = 1.0f;
@@ -529,16 +589,22 @@ interval:
                 speed = raw_speed;
                 if (speed > 100.0f) speed = 100.0f;
                 if (speed <   0.0f) speed = 0.0f;
+
+                ESP_LOGV("fanctrl", "[%u] PI: actual=%.2f target=%.1f error=%.2f integral=%.1f speed=%.1f",
+                         tick, actual, target, error, id(pi_integral), speed);
               } else {
                 speed = 100.0f;
+                ESP_LOGW("fanctrl", "[%u] PI: target is NaN, defaulting speed=100", tick);
               }
             }
 
-            // Slew rate limiter: max 3% change per tick to reduce fan noise
             static float prev_speed = 0.0f;
             const float max_step = 3.0f;
+            float pre_slew = speed;
             if (speed > prev_speed + max_step) speed = prev_speed + max_step;
             if (speed < prev_speed - max_step) speed = prev_speed - max_step;
+            if (pre_slew != speed)
+              ESP_LOGV("fanctrl", "[%u] SLEW: %.1f -> %.1f (was %.1f)", tick, pre_slew, speed, prev_speed);
             prev_speed = speed;
 
             const float target = id(set_target_temp).state;
@@ -562,36 +628,62 @@ interval:
             if (id(auto_fan4).state) apply(id(fan4_speed));
           }
 
-          // ── 5. Fan stall detection (skipped during safety override) ──
-          // If fan is ON at >50% but RPM is 0 for 30s (15 ticks), raise alarm.
-          // During override all fans are forced to 100% including unused ports,
-          // so stall checks would false-positive on unconnected fans.
+          // ── 5. Fan stall detection ──
           bool any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
                         || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
           if (!id(safety_override)) {
-            auto check_stall = [](auto *fan, float rpm, int &counter, const char *name) {
-              if (fan->state && fan->speed > 50 && rpm <= 0.0f && !std::isnan(rpm)) {
-                if (++counter == 15) ESP_LOGW("fanctrl", "Fan stall detected: %s", name);
+            auto check_stall = [tick](auto *fan, float rpm, int &counter, const char *name) {
+              bool stall_cond = fan->state && fan->speed > 50 && rpm <= 0.0f && !std::isnan(rpm);
+              if (stall_cond) {
+                counter++;
+                ESP_LOGW("fanctrl", "[%u] STALL %s: on=%d spd=%d rpm=%.0f count=%d/15",
+                         tick, name, fan->state, fan->speed, rpm, counter);
+                if (counter == 15) ESP_LOGW("fanctrl", "[%u] STALL CONFIRMED: %s", tick, name);
                 if (counter > 16) counter = 16;
               } else {
+                if (counter > 0)
+                  ESP_LOGW("fanctrl", "[%u] STALL %s: cleared (on=%d spd=%d rpm=%.0f was=%d)",
+                           tick, name, fan->state, fan->speed, rpm, counter);
                 counter = 0;
               }
             };
-            check_stall(id(fan1_speed), id(fan1_rpm).state, id(stall_count_1), "Fan 1");
-            check_stall(id(fan2_speed), id(fan2_rpm).state, id(stall_count_2), "Fan 2");
-            check_stall(id(fan3_speed), id(fan3_rpm).state, id(stall_count_3), "Fan 3");
-            check_stall(id(fan4_speed), id(fan4_rpm).state, id(stall_count_4), "Fan 4");
+            check_stall(id(fan1_speed), id(fan1_rpm).state, id(stall_count_1), "Fan1");
+            check_stall(id(fan2_speed), id(fan2_rpm).state, id(stall_count_2), "Fan2");
+            check_stall(id(fan3_speed), id(fan3_rpm).state, id(stall_count_3), "Fan3");
+            check_stall(id(fan4_speed), id(fan4_rpm).state, id(stall_count_4), "Fan4");
             any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
                      || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
             if (any_stall) {
-              ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED (fan stall)");
+              std::string stall_reason = "STALL(";
+              if (id(stall_count_1) >= 15) stall_reason += "Fan1 ";
+              if (id(stall_count_2) >= 15) stall_reason += "Fan2 ";
+              if (id(stall_count_3) >= 15) stall_reason += "Fan3 ";
+              if (id(stall_count_4) >= 15) stall_reason += "Fan4 ";
+              stall_reason += ")";
+              ESP_LOGW("fanctrl", "[%u] >>> SAFETY OVERRIDE ACTIVATED: %s", tick, stall_reason.c_str());
+              id(alarm_reason) = stall_reason;
+              id(alarm_reason_text).publish_state(stall_reason);
               id(safety_override) = true;
             }
           }
 
+          ESP_LOGV("fanctrl", "[%u] RPM: f1=%.0f f2=%.0f f3=%.0f f4=%.0f",
+                   tick, id(fan1_rpm).state, id(fan2_rpm).state,
+                   id(fan3_rpm).state, id(fan4_rpm).state);
+
           // ── 6. Alarm LED and binary sensor ──
           static bool alarm_was_active = false;
           bool alarm_active = id(safety_override) || any_stall;
+          if (alarm_active != alarm_was_active) {
+            ESP_LOGW("fanctrl", "[%u] ALARM %s reason=%s",
+                     tick, alarm_active ? "ON" : "OFF", id(alarm_reason).c_str());
+            ESP_LOGW("fanctrl", "[%u]   temps: dallas=%.2f aht20=%.2f esp32=%.2f (nan:%d/%d/%d) limit=%.1f",
+                     tick, dallas_cal, aht20_cal, esp32_cal, dallas_nan, aht20_nan, esp32_nan, limit);
+            ESP_LOGW("fanctrl", "[%u]   rpm: f1=%.0f f2=%.0f f3=%.0f f4=%.0f  stall=[%d,%d,%d,%d]",
+                     tick, id(fan1_rpm).state, id(fan2_rpm).state,
+                     id(fan3_rpm).state, id(fan4_rpm).state,
+                     id(stall_count_1), id(stall_count_2), id(stall_count_3), id(stall_count_4));
+          }
           if (alarm_active && !alarm_was_active) {
             auto call = id(alarm_light).turn_on();
             call.set_effect("Fast Pulse");
@@ -737,6 +829,13 @@ sensor:
 # ─── Text Sensors ────────────────────────────────────────────────────────────
 
 text_sensor:
+  - platform: template
+    id: alarm_reason_text
+    name: ${fdevicename}Alarm Reason
+    icon: mdi:alert-circle-outline
+    web_server:
+      sorting_weight: -1
+
   - platform: template
     name: ${fdevicename}Device
     entity_category: diagnostic
