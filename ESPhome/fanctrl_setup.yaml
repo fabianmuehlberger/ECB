@@ -1,0 +1,73 @@
+# Minimal ECB config: discover Dallas 1-Wire addresses for fanctrl.yaml
+#
+# 1. Connect Dallas sensor(s) to J2/J3 (GPIO27, 3.3V, GND) per readme.
+# 2. Flash:  esphome run fanctrl_setup.yaml   (USB, pick ttyUSB0)
+# 3. Watch serial logs; press reset on the board if needed.
+# 4. Copy lines like:
+#      [D][dallas.sensor:084]:     0x8b3ca8f64935b228 4
+#    into fanctrl.yaml substitutions:
+#      dallasaddress1: "0x........"
+# 5. Reflash fanctrl.yaml when done. Remove or rename this device if you no longer need it.
+
+substitutions:
+  devicename: fanctrl-setup
+  friendlyname: Fan Controller Setup
+
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+esphome:
+  name: ${devicename}
+  friendly_name: ${friendlyname}
+  min_version: "2024.11.0"
+
+esp32:
+  board: wemos_d1_mini32
+  variant: esp32
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP32_REV_MIN_3_1: "y"
+
+wifi:
+  ssid: ${ssid}
+  password: ${password}
+  ap:
+    ssid: ${devicename} Fallback
+    password: !secret ap_password
+
+logger:
+  level: DEBUG
+  logs:
+    dallas.sensor: DEBUG
+    one_wire: DEBUG
+
+# ECB Dallas bus: screw terminals J2/J3, data on GPIO27
+one_wire:
+  - platform: gpio
+    pin: GPIO27
+    id: dallas_bus
+
+# No fixed addresses — bus scan logs every device at DEBUG on boot/reset.
+# If you have multiple sensors, each index maps to one probe (order may vary).
+sensor:
+  - platform: dallas_temp
+    one_wire_id: dallas_bus
+    index: 0
+    name: Dallas index 0
+    update_interval: 5s
+  - platform: dallas_temp
+    one_wire_id: dallas_bus
+    index: 1
+    name: Dallas index 1
+    update_interval: 5s
+  - platform: dallas_temp
+    one_wire_id: dallas_bus
+    index: 2
+    name: Dallas index 2
+    update_interval: 5s
+  - platform: dallas_temp
+    one_wire_id: dallas_bus
+    index: 3
+    name: Dallas index 3
+    update_interval: 5s

@@ -26,7 +26,7 @@ substitutions:
   alarm_hysteresis: "3"
 
   # Dallas 1-Wire address (scan with logger level DEBUG)
-  dallasaddress1: "0xacc5035009646128"
+  dallasaddress1: "0x811ef15b1f64ff28"
 
   # 4-pin PWM fan spec frequency
   pwm_freq: "25600Hz"
@@ -112,7 +112,7 @@ time:
 # ─── Logging & Diagnostics ──────────────────────────────────────────────────
 
 logger:
-  level: INFO
+  level: DEBUG
 
 debug:
   update_interval: 120s
@@ -457,10 +457,11 @@ interval:
           // ── 2. Evaluate safety triggers ──
           bool trigger = false;
 
-          // A: Overtemp -- any valid sensor above alarm threshold for 10s (5 ticks)
+          // A: Overtemp -- any valid ambient sensor above alarm threshold for 10s (5 ticks).
+          // esp32_internal_temp is intentionally excluded: it measures the die temperature,
+          // which runs 15-25 °C above ambient under normal load and would create false alarms.
           bool any_overtemp = (!dallas_nan && id(Dallas_1).state >= limit)
-                           || (!aht20_nan  && id(AHT20T).state  >= limit)
-                           || (!esp32_nan  && id(esp32_internal_temp).state >= limit);
+                           || (!aht20_nan  && id(AHT20T).state  >= limit);
           if (any_overtemp) {
             if (++id(overtemp_ticks) >= 5) trigger = true;
           } else {
@@ -486,9 +487,9 @@ interval:
           } else if (id(safety_override)) {
             // Clear only when all valid sensors are below clear_limit
             bool all_clear = any_ok && !std::isnan(selected_raw);
+            // Only ambient sensors participate in the clear check (same exclusion as the trigger).
             if (!dallas_nan && id(Dallas_1).state >= clear_limit) all_clear = false;
             if (!aht20_nan  && id(AHT20T).state  >= clear_limit) all_clear = false;
-            if (!esp32_nan  && id(esp32_internal_temp).state >= clear_limit) all_clear = false;
             bool stall_clear = id(stall_count_1) < 15 && id(stall_count_2) < 15
                             && id(stall_count_3) < 15 && id(stall_count_4) < 15;
             if (all_clear && stall_clear) {
@@ -562,15 +563,22 @@ interval:
             if (id(auto_fan4).state) apply(id(fan4_speed));
           }
 
-          // ── 5. Fan stall detection (skipped during safety override) ──
-          // If fan is ON at >50% but RPM is 0 for 30s (15 ticks), raise alarm.
-          // During override all fans are forced to 100% including unused ports,
-          // so stall checks would false-positive on unconnected fans.
+          // ── 5. Fan stall detection ──
+          // Normal path (override inactive): if a fan is ON at any speed but RPM is 0
+          // for 30s (15 ticks), raise alarm. Threshold is > 0 (not > 50) so a fan
+          // unplugged at low PI-controller speeds is still caught. Unused ports must
+          // have their auto switch disabled -- that sets fan->state to false and
+          // prevents false positives.
+          //
+          // Recovery path (override active): fans are forced to 100%. Reset the stall
+          // counter for every fan that is now producing RPM so that stall_clear can
+          // become true and the override can auto-clear without manual intervention.
+          // Counters for fans that are still at 0 RPM remain at their current value.
           bool any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
                         || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
           if (!id(safety_override)) {
             auto check_stall = [](auto *fan, float rpm, int &counter, const char *name) {
-              if (fan->state && fan->speed > 50 && rpm <= 0.0f && !std::isnan(rpm)) {
+              if (fan->state && fan->speed > 0 && rpm <= 0.0f && !std::isnan(rpm)) {
                 if (++counter == 15) ESP_LOGW("fanctrl", "Fan stall detected: %s", name);
                 if (counter > 16) counter = 16;
               } else {
@@ -587,6 +595,17 @@ interval:
               ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED (fan stall)");
               id(safety_override) = true;
             }
+          } else {
+            // Recovery check: reset counter for any fan now spinning at 100% override speed.
+            auto check_recovery = [](float rpm, int &counter) {
+              if (!std::isnan(rpm) && rpm > 0.0f) counter = 0;
+            };
+            check_recovery(id(fan1_rpm).state, id(stall_count_1));
+            check_recovery(id(fan2_rpm).state, id(stall_count_2));
+            check_recovery(id(fan3_rpm).state, id(stall_count_3));
+            check_recovery(id(fan4_rpm).state, id(stall_count_4));
+            any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
+                     || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
           }
 
           // ── 6. Alarm LED and binary sensor ──

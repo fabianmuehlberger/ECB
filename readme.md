@@ -54,9 +54,9 @@ https://github.com/ESP32andmore/ECB/blob/main/ESPhome/ecb1.yaml
 with the device powered and connected to your host machine.
 
 * For Dallas sensors (flash board with logger level: DEBUG), to get device ID follow
-Seach for them in the initial logger output when connected to the USB port using ESPhome Web Flasher.
+Search for them in the initial logger output when connected to the USB port using ESPhome Web Flasher.
   - Connect your Dallas sensors with logger: DEBUG enabled (factory flash default).
-  - Open the ESPHome webtool, connect to the ECB board, view the "Logs" window, hit "Reset",and search for Dallas scan addresses and replace the below addresses with your unique ones. 
+  - Open the ESPHome webtool, connect to the ECB board, view the "Logs" window, hit "Reset", and search for Dallas scan addresses and replace the below addresses with your unique ones.
   - Example Scan:
   - [18:16:42][D][dallas.sensor:084]:     0x8b3ca8f64935b228 4
   - [18:16:42][D][dallas.sensor:084]:     0x783c0af6490d3628 2
