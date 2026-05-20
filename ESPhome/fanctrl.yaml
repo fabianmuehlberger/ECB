@@ -3,8 +3,9 @@
 # All fans share one target temperature and one sensor source selector.
 # Ver 5.0 -- Unified safety override, stall detection, on-boot fan burst.
 #
-# Safety policy: on overtemp, sensor failure, or all-NaN, ALL fans are forced
-# to 100% regardless of auto/manual mode. Cleared with hysteresis.
+# Safety policy: on overtemp of the SELECTED sensor, selected-sensor failure,
+# or all-NaN, ALL fans are forced to 100% regardless of auto/manual mode.
+# Cleared with hysteresis on the selected sensor.
 #
 # To scan Dallas 1-Wire addresses, temporarily set logger level to DEBUG.
 
@@ -20,7 +21,7 @@ substitutions:
   p_gain: "20"
   i_gain: "0.03"
 
-  # Safety threshold -- alarm triggers if ANY sensor exceeds this
+  # Safety threshold -- alarm triggers if the SELECTED sensor exceeds this
   alarm_temp: "50"
   # Degrees below alarm_temp before the safety override clears
   alarm_hysteresis: "3"
@@ -102,7 +103,7 @@ web_server:
   port: 80
   version: 3
   local: true
-  log: false
+  log: true
 
 time:
   - platform: sntp
@@ -419,33 +420,33 @@ interval:
     then:
       - lambda: |-
           // ── 1. Read sensors ──
-          // raw_state detects NaN immediately even with filter_out: NaN
+          // get_raw_state() detects NaN immediately even with filter_out: NaN
           // .state gives calibrated values for overtemp comparison and PI control
-          const bool dallas_nan = std::isnan(id(Dallas_1).raw_state);
-          const bool aht20_nan  = std::isnan(id(AHT20T).raw_state);
-          const bool esp32_nan  = std::isnan(id(esp32_internal_temp).raw_state);
+          const bool dallas_nan = std::isnan(id(Dallas_1).get_raw_state());
+          const bool aht20_nan  = std::isnan(id(AHT20T).get_raw_state());
+          const bool esp32_nan  = std::isnan(id(esp32_internal_temp).get_raw_state());
           const bool any_ok     = !dallas_nan || !aht20_nan || !esp32_nan;
           const bool all_nan    = dallas_nan && aht20_nan && esp32_nan;
 
           const float limit       = id(set_alarm_temp).state;
           const float clear_limit = limit - ${alarm_hysteresis};
 
-          // Selected source: raw for NaN check, state for PI calculation
+          // Selected source: get_raw_state() for NaN check, state for PI calculation
           float selected_raw = NAN;
           float actual = NAN;
           auto idx = id(fan_temp_source).active_index();
           if (idx.has_value()) {
             switch (idx.value()) {
               case 0:
-                selected_raw = id(Dallas_1).raw_state;
+                selected_raw = id(Dallas_1).get_raw_state();
                 actual       = id(Dallas_1).state;
                 break;
               case 1:
-                selected_raw = id(esp32_internal_temp).raw_state;
+                selected_raw = id(esp32_internal_temp).get_raw_state();
                 actual       = id(esp32_internal_temp).state;
                 break;
               case 2:
-                selected_raw = id(AHT20T).raw_state;
+                selected_raw = id(AHT20T).get_raw_state();
                 actual       = id(AHT20T).state;
                 break;
               default:
@@ -457,13 +458,14 @@ interval:
           // ── 2. Evaluate safety triggers ──
           bool trigger = false;
 
-          // A: Overtemp -- any valid ambient sensor above alarm threshold for 10s (5 ticks).
-          // esp32_internal_temp is intentionally excluded: it measures the die temperature,
-          // which runs 15-25 °C above ambient under normal load and would create false alarms.
-          bool any_overtemp = (!dallas_nan && id(Dallas_1).state >= limit)
-                           || (!aht20_nan  && id(AHT20T).state  >= limit);
-          if (any_overtemp) {
-            if (++id(overtemp_ticks) >= 5) trigger = true;
+          // A: Overtemp -- selected sensor above alarm threshold for 10s (5 ticks).
+          bool selected_overtemp = !std::isnan(selected_raw) && actual >= limit;
+          if (selected_overtemp) {
+            if (++id(overtemp_ticks) >= 5) {
+              trigger = true;
+              ESP_LOGW("fanctrl", "Overtemp: %s = %.1f °C >= %.1f °C (alarm threshold)",
+                       id(fan_temp_source).current_option().c_str(), actual, limit);
+            }
           } else {
             id(overtemp_ticks) = 0;
           }
@@ -482,14 +484,22 @@ interval:
 
           // ── 3. Set/clear safety_override with hysteresis ──
           if (trigger) {
-            if (!id(safety_override)) ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED");
+            if (!id(safety_override)) {
+              if (all_nan)
+                ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED -- reason: all sensors NaN");
+              else if (std::isnan(selected_raw))
+                ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED -- reason: selected sensor (%s) NaN",
+                         id(fan_temp_source).current_option().c_str());
+              else
+                ESP_LOGW("fanctrl", "SAFETY OVERRIDE ACTIVATED -- reason: overtemp (%s = %.1f °C)",
+                         id(fan_temp_source).current_option().c_str(), actual);
+            }
             id(safety_override) = true;
           } else if (id(safety_override)) {
             // Clear only when all valid sensors are below clear_limit
             bool all_clear = any_ok && !std::isnan(selected_raw);
-            // Only ambient sensors participate in the clear check (same exclusion as the trigger).
-            if (!dallas_nan && id(Dallas_1).state >= clear_limit) all_clear = false;
-            if (!aht20_nan  && id(AHT20T).state  >= clear_limit) all_clear = false;
+            // Clear only when the selected sensor is below the hysteresis threshold.
+            if (!std::isnan(selected_raw) && actual >= clear_limit) all_clear = false;
             bool stall_clear = id(stall_count_1) < 15 && id(stall_count_2) < 15
                             && id(stall_count_3) < 15 && id(stall_count_4) < 15;
             if (all_clear && stall_clear) {
@@ -501,16 +511,18 @@ interval:
 
           // ── 4. Apply fan control ──
           if (id(safety_override)) {
-            // Force ALL fans to 100% regardless of auto/manual mode
+            // Force Auto-enabled fans to 100%. Fans with Auto OFF are excluded:
+            // they are intentionally disabled (e.g. no fan connected) and must not
+            // be driven or participate in stall detection.
             auto force_max = [](auto *fan) {
               auto call = fan->turn_on();
               call.set_speed(100);
               call.perform();
             };
-            force_max(id(fan1_speed));
-            force_max(id(fan2_speed));
-            force_max(id(fan3_speed));
-            force_max(id(fan4_speed));
+            if (id(auto_fan1).state) force_max(id(fan1_speed));
+            if (id(auto_fan2).state) force_max(id(fan2_speed));
+            if (id(auto_fan3).state) force_max(id(fan3_speed));
+            if (id(auto_fan4).state) force_max(id(fan4_speed));
           } else {
             // Normal PI controller for auto-mode fans
             const bool any_auto = id(auto_fan1).state || id(auto_fan2).state
@@ -564,16 +576,15 @@ interval:
           }
 
           // ── 5. Fan stall detection ──
-          // Normal path (override inactive): if a fan is ON at any speed but RPM is 0
-          // for 30s (15 ticks), raise alarm. Threshold is > 0 (not > 50) so a fan
-          // unplugged at low PI-controller speeds is still caught. Unused ports must
-          // have their auto switch disabled -- that sets fan->state to false and
-          // prevents false positives.
+          // Normal path (override inactive): if an Auto-enabled fan is ON at any speed
+          // but its RPM is 0 for 30s (15 ticks), raise alarm. Fans with Auto OFF are
+          // fully excluded -- their stall counter is reset to 0 every tick, so disabling
+          // Auto on an unconnected port prevents false positives without any other config.
           //
-          // Recovery path (override active): fans are forced to 100%. Reset the stall
-          // counter for every fan that is now producing RPM so that stall_clear can
-          // become true and the override can auto-clear without manual intervention.
-          // Counters for fans that are still at 0 RPM remain at their current value.
+          // Recovery path (override active): Auto-enabled fans are forced to 100%.
+          // Reset the stall counter for every such fan now producing RPM so that
+          // stall_clear can become true and the override can auto-clear.
+          // Auto-OFF fans are excluded here too; their counters stay at 0.
           bool any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
                         || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
           if (!id(safety_override)) {
@@ -585,10 +596,14 @@ interval:
                 counter = 0;
               }
             };
-            check_stall(id(fan1_speed), id(fan1_rpm).state, id(stall_count_1), "Fan 1");
-            check_stall(id(fan2_speed), id(fan2_rpm).state, id(stall_count_2), "Fan 2");
-            check_stall(id(fan3_speed), id(fan3_rpm).state, id(stall_count_3), "Fan 3");
-            check_stall(id(fan4_speed), id(fan4_rpm).state, id(stall_count_4), "Fan 4");
+            auto check_or_reset = [&check_stall](bool is_auto, auto *fan, float rpm, int &counter, const char *name) {
+              if (is_auto) check_stall(fan, rpm, counter, name);
+              else         counter = 0;
+            };
+            check_or_reset(id(auto_fan1).state, id(fan1_speed), id(fan1_rpm).state, id(stall_count_1), "Fan 1");
+            check_or_reset(id(auto_fan2).state, id(fan2_speed), id(fan2_rpm).state, id(stall_count_2), "Fan 2");
+            check_or_reset(id(auto_fan3).state, id(fan3_speed), id(fan3_rpm).state, id(stall_count_3), "Fan 3");
+            check_or_reset(id(auto_fan4).state, id(fan4_speed), id(fan4_rpm).state, id(stall_count_4), "Fan 4");
             any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
                      || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
             if (any_stall) {
@@ -600,10 +615,10 @@ interval:
             auto check_recovery = [](float rpm, int &counter) {
               if (!std::isnan(rpm) && rpm > 0.0f) counter = 0;
             };
-            check_recovery(id(fan1_rpm).state, id(stall_count_1));
-            check_recovery(id(fan2_rpm).state, id(stall_count_2));
-            check_recovery(id(fan3_rpm).state, id(stall_count_3));
-            check_recovery(id(fan4_rpm).state, id(stall_count_4));
+            if (id(auto_fan1).state) check_recovery(id(fan1_rpm).state, id(stall_count_1));
+            if (id(auto_fan2).state) check_recovery(id(fan2_rpm).state, id(stall_count_2));
+            if (id(auto_fan3).state) check_recovery(id(fan3_rpm).state, id(stall_count_3));
+            if (id(auto_fan4).state) check_recovery(id(fan4_rpm).state, id(stall_count_4));
             any_stall = id(stall_count_1) >= 15 || id(stall_count_2) >= 15
                      || id(stall_count_3) >= 15 || id(stall_count_4) >= 15;
           }
